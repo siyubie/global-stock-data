@@ -115,6 +115,15 @@ pip install requests
 | 美股 NYSE | `TICKER.N` | `BABA.N`, `JD.N` |
 | 港股 | `CODE.HK` | `00700.HK`, `09988.HK` |
 
+### 常用输入代码规范
+
+调用函数时优先使用交易端常见代码，函数内部再转换成各数据源需要的格式：
+
+| 市场 | 建议输入 | 数据源格式示例 |
+|------|----------|----------------|
+| 美股 | `AAPL` | Yahoo/SEC/新浪/腾讯均使用 ticker 变体 |
+| 港股 | `00700` | 东财 `116.00700` / 新浪 `rt_hk00700` / 腾讯 `hk00700` / Yahoo `0700.HK` |
+
 ---
 
 ## 共用 Helper 函数
@@ -181,6 +190,83 @@ def eastmoney_datacenter(report_name: str, columns: str = "ALL",
     if d.get("result") and d["result"].get("data"):
         return d["result"]["data"]
     return []
+```
+
+### 代码规范与数据新鲜度
+
+```python
+from datetime import datetime, timezone, timedelta, time
+
+HKT = timezone(timedelta(hours=8))
+
+
+def _to_number(value):
+    """东财字段清洗：把 "-", None, "" 统一成 None，其余尽量转成 int/float。"""
+    if value in (None, "-", ""):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    try:
+        f = float(value)
+        return int(f) if f.is_integer() else f
+    except (TypeError, ValueError):
+        return value
+
+
+def normalize_hk_code(code: str) -> str:
+    """港股代码标准化为 5 位数字，如 700/0700/00700.HK -> 00700。"""
+    s = str(code).upper().replace(".HK", "").replace("HK", "")
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if not digits:
+        raise ValueError(f"invalid HK code: {code}")
+    return digits.zfill(5)
+
+
+def hk_to_eastmoney_secid(code: str) -> str:
+    """港股代码转东财 secid，如 00700 -> 116.00700。"""
+    return f"116.{normalize_hk_code(code)}"
+
+
+def hk_to_yahoo_symbol(code: str) -> str:
+    """港股代码转 Yahoo symbol，如 00700 -> 0700.HK。"""
+    return f"{int(normalize_hk_code(code)):04d}.HK"
+
+
+def eastmoney_timestamp_to_market_time(timestamp: int | str) -> str | None:
+    """东财 f124 Unix 秒级时间戳转香港时间字符串。"""
+    ts = _to_number(timestamp)
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(int(ts), HKT).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def hk_data_freshness(timestamp: int | str, max_session_delay_minutes: int = 30) -> dict:
+    """
+    港股行情新鲜度检查。
+    交易时段内超过 max_session_delay_minutes 未更新标记为 stale；
+    非交易时段内主要检查返回日期是否为当前香港日期。
+    不处理港股假期日历，遇到假期需结合交易所日历再判断。
+    """
+    ts = _to_number(timestamp)
+    if ts is None:
+        return {"market_time": None, "age_minutes": None, "is_stale": True}
+
+    market_dt = datetime.fromtimestamp(int(ts), HKT)
+    now = datetime.now(HKT)
+    age_minutes = (now - market_dt).total_seconds() / 60
+    in_session = (
+        now.weekday() < 5 and (
+            time(9, 30) <= now.time() <= time(12, 0) or
+            time(13, 0) <= now.time() <= time(16, 30)
+        )
+    )
+    is_stale = age_minutes > max_session_delay_minutes if in_session else market_dt.date() != now.date()
+
+    return {
+        "market_time": market_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "age_minutes": round(age_minutes, 1),
+        "is_stale": is_stale,
+    }
 ```
 
 ---
@@ -406,7 +492,7 @@ def stock_quote_eastmoney(ticker_or_code: str, secid_prefix: int = 105) -> dict:
 
 两个独立数据源。新浪最长可回溯到 1984 年；Yahoo 适合需要复权数据的场景。
 
-> **注意：** 东财 push2his kline/get 端点实测不返回美股/港股数据（2026-05-20 验证），仅支持 A 股。美股/港股 K 线用新浪和 Yahoo。
+> **注意：** 东财 push2his kline/get 端点实测不返回美股/港股 K 线数据（2026-05-20 验证），仅支持 A 股。美股/港股日/周/月 K 线用新浪和 Yahoo；港股当天分时可用东财 push2his trends2。
 
 ```python
 def us_stock_kline_sina(ticker: str, num: int = 120) -> list[dict]:
@@ -475,12 +561,50 @@ def stock_kline_yahoo(symbol: str, interval: str = "1d",
     return result
 ```
 
-### 2.2 港股 K 线 — Yahoo（唯一可用源）
+### 2.2 港股日/周/月 K 线 — Yahoo
 
-港股 K 线只有 Yahoo 一个可用源（新浪港股K线已失效，东财 push2his 不返回港股K线数据）。
+港股日/周/月 K 线使用 Yahoo chart。新浪港股 K 线已失效，东财 push2his kline/get 不返回港股 K 线数据。
 
 ```python
-# 港股 Yahoo K线: 直接调 stock_kline_yahoo("0700.HK")
+# 港股 Yahoo K线: 直接调 stock_kline_yahoo(hk_to_yahoo_symbol("00700"))
+```
+
+### 2.3 港股当天分时走势 — 东财 push2his trends2
+
+```python
+def hk_intraday_trends(code: str, ndays: int = 1) -> list[dict]:
+    """
+    港股当天/近几天分时走势 — 东财 push2his trends2
+    code: 港股代码，如 "00700"
+    ndays: 1=当天，最多按东财接口支持范围返回
+    返回: [{time, price, avg_price, volume, amount, raw}, ...]
+    """
+    url = "https://push2his.eastmoney.com/api/qt/stock/trends2/get"
+    params = {
+        "secid": hk_to_eastmoney_secid(code),
+        "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+        "iscr": 0,
+        "iscca": 0,
+        "ndays": ndays,
+    }
+    r = requests.get(url, params=params, headers={"User-Agent": UA}, timeout=15)
+    d = r.json()
+    data = d.get("data") or {}
+    trends = data.get("trends") or []
+
+    result = []
+    for line in trends:
+        parts = line.split(",")
+        result.append({
+            "time": parts[0] if len(parts) > 0 else None,
+            "price": _to_number(parts[1]) if len(parts) > 1 else None,
+            "avg_price": _to_number(parts[2]) if len(parts) > 2 else None,
+            "volume": _to_number(parts[5]) if len(parts) > 5 else None,
+            "amount": _to_number(parts[6]) if len(parts) > 6 else None,
+            "raw": parts,
+        })
+    return result
 ```
 
 ---
@@ -1341,10 +1465,11 @@ def market_stock_list(market: str = "us_nasdaq", sort_field: str = "f3",
     东财 push2 全市场股票列表 — 涨跌幅/成交量/成交额排名
     market: "us_nasdaq" (m:105), "us_nyse" (m:106), "hk" (m:116)
     sort_field: 排序字段
-      f3=涨跌幅, f5=成交量, f6=成交额, f2=最新价, f7=振幅, f15=最高, f16=最低
+      f3=涨跌幅, f5=成交量, f6=成交额, f2=最新价, f7=振幅, f8=换手率,
+      f10=量比, f15=最高, f16=最低, f20=总市值, f21=流通市值
     sort_desc: True=降序(默认), False=升序
     page/page_size: 分页（默认第1页，每页20条）
-    返回: {"total": 5925, "stocks": [{code, name, price, change_pct, volume, ...}, ...]}
+    返回: {"total": 5925, "stocks": [{code, name, price, change_pct, turnover_rate, ...}, ...]}
     
     典型用途:
     - 今日涨幅 TOP 20: market_stock_list("us_nasdaq", "f3", True)
@@ -1358,11 +1483,14 @@ def market_stock_list(market: str = "us_nasdaq", sort_field: str = "f3",
     url = "https://push2.eastmoney.com/api/qt/clist/get"
     params = {
         "fs": fs,
-        "fields": "f2,f3,f4,f5,f6,f7,f12,f14,f15,f16,f17,f18",
+        "fields": "f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f14,f15,f16,f17,f18,f20,f21,f23,f24,f25,f124",
         "pn": page,
         "pz": page_size,
         "fid": sort_field,
         "po": 1 if sort_desc else 0,
+        "fltt": 2,
+        "invt": 2,
+        "np": 1,
     }
     r = requests.get(url, params=params, timeout=15)
     d = r.json()
@@ -1377,23 +1505,53 @@ def market_stock_list(market: str = "us_nasdaq", sort_field: str = "f3",
     
     stocks = []
     for item in diff:
+        freshness = hk_data_freshness(item.get("f124")) if market == "hk" else None
         stocks.append({
             "code": item.get("f12"),         # 股票代码
             "name": item.get("f14"),         # 中文名
-            "price": item.get("f2"),         # 最新价(原始值, 需÷10^小数位)
-            "change_pct": round(item["f3"] / 100, 2) if item.get("f3") is not None else None,  # 涨跌幅(%)
-            "change_amount": item.get("f4"), # 涨跌额(原始值)
-            "volume": item.get("f5"),        # 成交量(股)
-            "amount": item.get("f6"),        # 成交额
-            "amplitude": round(item["f7"] / 100, 2) if item.get("f7") is not None else None,  # 振幅(%)
-            "high": item.get("f15"),         # 最高(原始值)
-            "low": item.get("f16"),          # 最低(原始值)
-            "open": item.get("f17"),         # 开盘(原始值)
-            "prev_close": item.get("f18"),   # 昨收(原始值)
+            "price": _to_number(item.get("f2")),              # 最新价
+            "change_pct": _to_number(item.get("f3")),         # 涨跌幅(%)
+            "change_amount": _to_number(item.get("f4")),      # 涨跌额
+            "volume": _to_number(item.get("f5")),             # 成交量(股)
+            "amount": _to_number(item.get("f6")),             # 成交额
+            "amplitude": _to_number(item.get("f7")),          # 振幅(%)
+            "turnover_rate": _to_number(item.get("f8")),      # 换手率(%)
+            "pe": _to_number(item.get("f9")),                 # 市盈率
+            "volume_ratio": _to_number(item.get("f10")),      # 量比
+            "high": _to_number(item.get("f15")),              # 最高
+            "low": _to_number(item.get("f16")),               # 最低
+            "open": _to_number(item.get("f17")),              # 开盘
+            "prev_close": _to_number(item.get("f18")),        # 昨收
+            "market_cap": _to_number(item.get("f20")),        # 总市值
+            "float_market_cap": _to_number(item.get("f21")),  # 流通市值
+            "pb": _to_number(item.get("f23")),                # 市净率
+            "change_pct_60d": _to_number(item.get("f24")),    # 60日涨跌幅(%)
+            "change_pct_ytd": _to_number(item.get("f25")),    # 年初至今涨跌幅(%)
+            "timestamp": _to_number(item.get("f124")),        # 东财 Unix 秒级时间戳
+            "market_time": eastmoney_timestamp_to_market_time(item.get("f124")),
+            "freshness": freshness,
         })
     
     return {"total": total, "stocks": stocks}
 ```
+
+### 8.5 港股全市场字段说明
+
+`market_stock_list("hk", page_size=100)` 返回的港股字段可直接用于全市场扫描：
+
+| 字段 | 含义 |
+|------|------|
+| `code`, `name` | 港股代码与中文名 |
+| `price`, `change_pct`, `change_amount` | 最新价、涨跌幅%、涨跌额 |
+| `volume`, `amount` | 成交量、成交额 |
+| `amplitude`, `turnover_rate`, `volume_ratio` | 振幅%、换手率%、量比 |
+| `open`, `high`, `low`, `prev_close` | 今开、最高、最低、昨收 |
+| `market_cap`, `float_market_cap` | 总市值、流通市值 |
+| `pe`, `pb` | 市盈率、市净率 |
+| `change_pct_60d`, `change_pct_ytd` | 60日涨跌幅%、年初至今涨跌幅% |
+| `timestamp`, `market_time`, `freshness` | 东财更新时间戳、香港时间、数据新鲜度检查 |
+
+港股代码输入统一使用交易端常见 5 位代码，如 `00700`。需要 Yahoo 格式时调用 `hk_to_yahoo_symbol("00700")`，需要东财 secid 时调用 `hk_to_eastmoney_secid("00700")`。
 
 ---
 
@@ -1405,6 +1563,7 @@ def market_stock_list(market: str = "us_nasdaq", sort_field: str = "f3",
 | 港股行情 | 腾讯 `r_hkXXXXX` | 新浪 / 东财 push2 | 腾讯字段最全(78个) |
 | 美股K线 | 新浪 | Yahoo chart | 新浪回溯至1984年；Yahoo支持多周期 |
 | 港股K线 | Yahoo chart | — | 新浪港股K线已失效；push2his不返回港股K线 |
+| 港股分时 | 东财 push2his trends2 | Yahoo chart 分钟线 | trends2 返回当天分时；Yahoo 可用于分钟级K线 |
 | 财报三表(中文) | 东财 datacenter | — | 中文科目名，按行展开 |
 | 财报三表(结构化) | Yahoo quoteSummary | — | 英文，完整报表结构 |
 | 关键指标(中文) | 东财 GMAININDICATOR | — | ROE/ROA/EPS/毛利率/资产负债率 (美49/港75字段) |
@@ -1426,7 +1585,7 @@ def market_stock_list(market: str = "us_nasdaq", sort_field: str = "f3",
 | 数据源 | 协议 | 鉴权 | 覆盖 |
 |--------|------|------|------|
 | 东财 push2 | HTTPS | 零 | 美股+港股 实时行情+全市场列表 |
-| 东财 push2his | HTTPS | 零 | 美股+港股 资金流（K线仅A股，不覆盖美股/港股） |
+| 东财 push2his | HTTPS | 零 | 美股+港股 资金流；港股当天分时；K线仅A股，不覆盖美股/港股 |
 | 东财 datacenter | HTTPS | 零 | 美股+港股 财报三表+GMAININDICATOR关键指标 |
 | 东财 search API | HTTPS | 零 | 全球股票搜索+secid映射 |
 | Yahoo Finance | HTTPS | cookie+crumb(自动) | 美股+港股 全品类 |
